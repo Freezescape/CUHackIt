@@ -90,75 +90,95 @@ class ONNXDetector:
         return input_tensor
     
     def postprocess(self, outputs, original_shape):
-        """Postprocess ONNX model outputs"""
-        # ONNX output format: [batch, num_detections, 85]
-        # 85 = 4 (bbox) + 1 (confidence) + 80 (class probabilities)
-        
-        detections = outputs[0]  # Get first batch
-        
-        # Squeeze to remove extra dimensions if present
-        detections = np.squeeze(detections)
-        
-        boxes = []
-        scores = []
-        class_ids = []
-        
-        for detection in detections:
-            # Handle multi-dimensional arrays by squeezing
-            confidence = float(np.squeeze(detection[4]))
-            
-            if confidence > CONFIDENCE_THRESHOLD:
-                # Get class with highest probability
-                class_probs = detection[5:]
-                class_id = np.argmax(class_probs)
-                class_score = float(np.squeeze(class_probs[class_id]))
-                
-                # Overall confidence = object confidence * class confidence
-                overall_confidence = confidence * class_score
-                
-                if overall_confidence > CONFIDENCE_THRESHOLD:
-                    # Get bounding box coordinates
-                    x_center, y_center, width, height = detection[:4]
-                    
-                    # Convert to corner coordinates (x, y, w, h format for NMSBoxes)
-                    x = int((x_center - width / 2) * original_shape[1] / self.input_width)
-                    y = int((y_center - height / 2) * original_shape[0] / self.input_height)
-                    w = int(width * original_shape[1] / self.input_width)
-                    h = int(height * original_shape[0] / self.input_height)
-                    
-                    # Ensure valid bounding box coordinates
-                    if w > 0 and h > 0 and x >= 0 and y >= 0:
-                        boxes.append([x, y, w, h])  # x, y, w, h format
-                        scores.append(overall_confidence)
-                        class_ids.append(class_id)
-        
-        # Apply non-maximum suppression with correct format
+        pred = outputs[0]
+        pred = np.squeeze(pred)
+
+        # Force into (N, D)
+        if pred.ndim == 3:
+            pred = pred[0]  # (D, N) or (N, D)
+
+        if pred.ndim != 2:
+            logger.error(f"Unexpected pred ndim: {pred.ndim}, shape: {pred.shape}")
+            return []
+
+        # If it's (D, N) transpose to (N, D)
+        if pred.shape[0] in (84, 85) and pred.shape[1] not in (84, 85):
+            pred = pred.T
+
+        D = pred.shape[1]  # features per detection
+        if D not in (84, 85):
+            logger.error(f"Unexpected detection length D={D}. Shape={pred.shape}. Can't map classes.")
+            return []
+
+        boxes, scores, class_ids = [], [], []
+        orig_h, orig_w = original_shape[:2]
+
+        for det in pred:
+            x, y, w, h = det[:4]
+
+            if D == 85:
+                # YOLOv5-style: [x,y,w,h, obj, 80 class probs]
+                obj = float(det[4])
+                class_scores = det[5:]
+                class_id = int(np.argmax(class_scores))
+                score = obj * float(class_scores[class_id])
+            else:
+                # YOLOv8 common: [x,y,w,h, 80 class scores]
+                class_scores = det[4:]
+                class_id = int(np.argmax(class_scores))
+                score = float(class_scores[class_id])
+
+            # Hard safety: skip if class index doesn't match your CLASSES list
+            if class_id < 0 or class_id >= len(CLASSES):
+                continue
+
+            if score < CONFIDENCE_THRESHOLD:
+                continue
+
+            x1 = int((x - w / 2) * orig_w / self.input_width)
+            y1 = int((y - h / 2) * orig_h / self.input_height)
+            x2 = int((x + w / 2) * orig_w / self.input_width)
+            y2 = int((y + h / 2) * orig_h / self.input_height)
+
+            boxes.append([x1, y1, x2 - x1, y2 - y1])  # xywh for NMS
+            scores.append(score)
+            class_ids.append(class_id)
+
+        for det in pred:
+            x, y, w, h = det[:4]
+
+            # YOLOv8: class scores start at index 4
+            class_scores = det[4:]
+            class_id = int(np.argmax(class_scores))
+            score = float(class_scores[class_id])
+
+            if score < CONFIDENCE_THRESHOLD:
+                continue
+
+            # Convert to pixel coordinates
+            x1 = int((x - w / 2) * orig_w / self.input_width)
+            y1 = int((y - h / 2) * orig_h / self.input_height)
+            x2 = int((x + w / 2) * orig_w / self.input_width)
+            y2 = int((y + h / 2) * orig_h / self.input_height)
+
+            # Store as xywh for NMSBoxes
+            boxes.append([x1, y1, x2 - x1, y2 - y1])
+            scores.append(score)
+            class_ids.append(class_id)
+
         results = []
+
         if len(boxes) > 0:
-            try:
-                indices = cv2.dnn.NMSBoxes(boxes, scores, CONFIDENCE_THRESHOLD, IOU_THRESHOLD)
-                
-                if len(indices) > 0:
-                    # Handle both single index and array of indices
-                    if isinstance(indices, np.ndarray):
-                        indices = indices.flatten()
-                    else:
-                        indices = [indices]
-                    
-                    for i in indices:
-                        # Ensure class_id is within valid range
-                        class_id = class_ids[i]
-                        if 0 <= class_id < len(CLASSES):
-                            results.append({
-                                'class': CLASSES[class_id],
-                                'confidence': float(scores[i]),
-                                'bbox': boxes[i]
-                            })
-                        else:
-                            logger.warning(f"⚠️  Invalid class ID: {class_id}")
-            except Exception as e:
-                logger.error(f"❌ NMSBoxes error: {e}")
-        
+            indices = cv2.dnn.NMSBoxes(boxes, scores, CONFIDENCE_THRESHOLD, IOU_THRESHOLD)
+
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    results.append({
+                        'class': CLASSES[class_ids[i]],
+                        'confidence': float(scores[i]),
+                        'bbox': boxes[i]
+                    })
+
         return results
 
 # ── Security System Class (Completely Fixed) ──────────────────────────────────
